@@ -1,0 +1,754 @@
+
+`timescale 1ns / 1ps
+// =============================================================================
+//  UART BLACKBOX FLIGHT RECORDER
+//  Modules:
+//    1. uart_rx          - UART receiver (8N1, configurable baud)
+//    2. packet_buffer    - Address-based circular memory (100 packets)
+//                          Frame: [TX_NO(8) | DATA(8)]
+//    3. fsm_controller   - Blackbox FSM  (IDLE → RECORD → DUMP → HALT)
+//    4. spi_master       - OpenCores-style SPI master (dump to flash)
+//    5. i2c_master       - OpenCores-style I2C master (config / status)
+//    6. uart_blackbox_top - Top-level integration
+// =============================================================================
+ 
+`timescale 1ns/1ps
+ 
+// ─────────────────────────────────────────────────────────────────────────────
+// 1. UART RX  (8N1, oversampling x16)
+//    Parameters: CLK_FREQ, BAUD_RATE
+//    Outputs:    rx_data[7:0], rx_valid (1-clk pulse)
+// ─────────────────────────────────────────────────────────────────────────────
+module blackbox #(
+    parameter CLK_FREQ  = 50_000_000,
+    parameter BAUD_RATE = 115_200
+)(
+    input  wire       clk,
+    input  wire       rst_n,
+    input  wire       rx,
+    output reg  [7:0] rx_data,
+    output reg        rx_valid
+);
+    localparam CLKS_PER_BIT = CLK_FREQ / BAUD_RATE;          // samples per bit
+    localparam HALF_BIT     = CLKS_PER_BIT / 2;
+ 
+    // FSM states
+    localparam S_IDLE  = 2'd0;
+    localparam S_START = 2'd1;
+    localparam S_DATA  = 2'd2;
+    localparam S_STOP  = 2'd3;
+ 
+    reg [1:0]                    state;
+    reg [$clog2(CLKS_PER_BIT):0] clk_cnt;
+    reg [2:0]                    bit_idx;
+    reg [7:0]                    shift_reg;
+    reg                          rx_sync0, rx_sync1;   // 2-FF metastability sync
+ 
+    // Synchronise async RX line
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            rx_sync0 <= 1'b1;
+            rx_sync1 <= 1'b1;
+        end else begin
+            rx_sync0 <= rx;
+            rx_sync1 <= rx_sync0;
+        end
+    end
+ 
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            state     <= S_IDLE;
+            clk_cnt   <= 0;
+            bit_idx   <= 0;
+            shift_reg <= 0;
+            rx_data   <= 0;
+            rx_valid  <= 0;
+        end else begin
+            rx_valid <= 0;                // default: deassert
+ 
+            case (state)
+                S_IDLE: begin
+                    if (!rx_sync1) begin  // falling edge = start bit
+                        state   <= S_START;
+                        clk_cnt <= 0;
+                    end
+                end
+ 
+                S_START: begin
+                    if (clk_cnt == HALF_BIT - 1) begin
+                        if (!rx_sync1) begin   // still low → valid start
+                            state   <= S_DATA;
+                            clk_cnt <= 0;
+                            bit_idx <= 0;
+                        end else begin
+                            state <= S_IDLE;   // glitch, abort
+                        end
+                    end else begin
+                        clk_cnt <= clk_cnt + 1;
+                    end
+                end
+ 
+                S_DATA: begin
+                    if (clk_cnt == CLKS_PER_BIT - 1) begin
+                        clk_cnt              <= 0;
+                        shift_reg[bit_idx]   <= rx_sync1;
+                        if (bit_idx == 7) begin
+                            state   <= S_STOP;
+                        end else begin
+                            bit_idx <= bit_idx + 1;
+                        end
+                    end else begin
+                        clk_cnt <= clk_cnt + 1;
+                    end
+                end
+ 
+                S_STOP: begin
+                    if (clk_cnt == CLKS_PER_BIT - 1) begin
+                        rx_valid  <= 1'b1;
+                        rx_data   <= shift_reg;
+                        state     <= S_IDLE;
+                        clk_cnt   <= 0;
+                    end else begin
+                        clk_cnt <= clk_cnt + 1;
+                    end
+                end
+ 
+                default: state <= S_IDLE;
+            endcase
+        end
+    end
+endmodule
+ 
+ 
+// ─────────────────────────────────────────────────────────────────────────────
+// 2. PACKET BUFFER  - Address-based circular memory
+//    Stores 100 packets.  Frame layout (16 bits):
+//        [15:8]  TX_NO  - packet sequence number (wraps 0-255)
+//        [ 7:0]  DATA   - payload byte
+//
+//    Ports:
+//      wr_en / wr_data  → write from UART
+//      rd_addr / rd_data → random read (SPI dump reads sequentially)
+//      pkt_count        → number of valid packets stored (0-100)
+// ─────────────────────────────────────────────────────────────────────────────
+module packet_buffer (
+    input  wire        clk,
+    input  wire        rst_n,
+    // Write port (from UART)
+    input  wire        wr_en,
+    input  wire [7:0]  wr_data,     // raw DATA byte
+    // Read port (from SPI dump FSM)
+    input  wire [6:0]  rd_addr,     // 0-99
+    output reg  [15:0] rd_data,     // {TX_NO, DATA}
+    // Status
+    output wire [6:0]  pkt_count,   // packets stored (≤100)
+    output wire [6:0]  head_ptr     // current write head
+);
+    localparam DEPTH = 100;
+ 
+    // Memory array: 100 x 16-bit frames
+    reg [15:0] mem [0:DEPTH-1];
+    reg [6:0]  wr_ptr;              // next write address (0-99, wraps)
+    reg [6:0]  stored;              // number of valid entries
+    reg [7:0]  tx_no;               // auto-incremented sequence number
+ 
+    assign pkt_count = stored;
+    assign head_ptr  = wr_ptr;
+ 
+    integer i;
+ 
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            wr_ptr <= 0;
+            stored <= 0;
+            tx_no  <= 0;
+            for (i = 0; i < DEPTH; i = i + 1)
+                mem[i] <= 16'h0000;
+        end else if (wr_en) begin
+            // Write frame: {TX_NO, DATA}
+            mem[wr_ptr] <= {tx_no, wr_data};
+            tx_no        <= tx_no + 1;
+            // Advance circular pointer
+            wr_ptr       <= (wr_ptr == DEPTH - 1) ? 7'd0 : wr_ptr + 1;
+            // Count up to DEPTH
+            if (stored < DEPTH)
+                stored <= stored + 1;
+        end
+    end
+ 
+    // Asynchronous read (combinational)
+    always @(*) begin
+        if (rd_addr < DEPTH)
+            rd_data = mem[rd_addr];
+        else
+            rd_data = 16'hFFFF;
+    end
+endmodule
+ 
+ 
+// ─────────────────────────────────────────────────────────────────────────────
+// 3. FSM CONTROLLER
+//    States:
+//      IDLE    - waiting for trigger (fault or manual reset)
+//      RECORD  - normal operation, UART packets flowing in
+//      DUMP    - dump last 100 packets over SPI to external flash
+//      HALT    - dump complete, freeze until hard reset
+//
+//    Trigger sources:
+//      fault_trigger - hardware fault line (e.g. brownout, watchdog)
+//      manual_dump   - software / button trigger
+// ─────────────────────────────────────────────────────────────────────────────
+module fsm_controller (
+    input  wire       clk,
+    input  wire       rst_n,
+    // Trigger inputs
+    input  wire       fault_trigger,
+    input  wire       manual_dump,
+    // UART data in
+    input  wire [7:0] uart_rx_data,
+    input  wire       uart_rx_valid,
+    // Buffer interface
+    output reg        buf_wr_en,
+    output reg  [7:0] buf_wr_data,
+    input  wire [6:0] buf_pkt_count,
+    // SPI dump interface
+    output reg        dump_start,
+    input  wire       dump_done,
+    // I2C status broadcast
+    output reg  [7:0] i2c_status_byte,
+    output reg        i2c_wr_req,
+    // State output (debug)
+    output reg  [1:0] fsm_state
+);
+    localparam IDLE   = 2'd0;
+    localparam RECORD = 2'd1;
+    localparam DUMP   = 2'd2;
+    localparam HALT   = 2'd3;
+ 
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            fsm_state      <= IDLE;
+            buf_wr_en      <= 0;
+            buf_wr_data    <= 0;
+            dump_start     <= 0;
+            i2c_status_byte<= 8'h00;
+            i2c_wr_req     <= 0;
+        end else begin
+            // Default deassert
+            buf_wr_en  <= 0;
+            dump_start <= 0;
+            i2c_wr_req <= 0;
+ 
+            case (fsm_state)
+                // ── IDLE ─────────────────────────────────────────────
+                IDLE: begin
+                    i2c_status_byte <= 8'hAA;    // status: idle
+                    i2c_wr_req      <= 1;
+                    fsm_state       <= RECORD;   // immediately start recording
+                end
+ 
+                // ── RECORD ───────────────────────────────────────────
+                RECORD: begin
+                    i2c_status_byte <= 8'h01;    // status: recording
+ 
+                    // Pass UART data into circular buffer
+                    if (uart_rx_valid) begin
+                        buf_wr_en   <= 1;
+                        buf_wr_data <= uart_rx_data;
+                    end
+ 
+                    // Trigger transition to DUMP
+                    if (fault_trigger || manual_dump) begin
+                        fsm_state       <= DUMP;
+                        dump_start      <= 1;
+                        i2c_status_byte <= 8'h02;  // status: dump triggered
+                        i2c_wr_req      <= 1;
+                    end
+                end
+ 
+                // ── DUMP ─────────────────────────────────────────────
+                DUMP: begin
+                    i2c_status_byte <= 8'h02;    // status: dumping
+                    if (dump_done) begin
+                        fsm_state       <= HALT;
+                        i2c_status_byte <= 8'h03;  // status: complete
+                        i2c_wr_req      <= 1;
+                    end
+                end
+ 
+                // ── HALT ─────────────────────────────────────────────
+                HALT: begin
+                    i2c_status_byte <= 8'h03;    // status: halted
+                    // Only hard reset (rst_n) escapes HALT
+                end
+ 
+                default: fsm_state <= IDLE;
+            endcase
+        end
+    end
+endmodule
+ 
+ 
+// ─────────────────────────────────────────────────────────────────────────────
+// 4. SPI MASTER  (OpenCores-style, Mode 0: CPOL=0, CPHA=0)
+//    Reads all stored packets from packet_buffer and shifts them out
+//    to external SPI flash one byte at a time.
+//    Sends:  {TX_NO[7:0], DATA[7:0]}  per packet  → 2 bytes per frame
+// ─────────────────────────────────────────────────────────────────────────────
+module spi_master (
+    input  wire        clk,
+    input  wire        rst_n,
+    // Control
+    input  wire        dump_start,    // pulse to begin dump
+    input  wire [6:0]  pkt_count,     // how many packets to send
+    output reg         dump_done,     // pulse when all packets sent
+    // Packet buffer read interface
+    output reg  [6:0]  buf_rd_addr,
+    input  wire [15:0] buf_rd_data,   // {TX_NO, DATA}
+    // SPI pins
+    output reg         spi_sclk,
+    output reg         spi_mosi,
+    input  wire        spi_miso,      // not used for dump, kept for completeness
+    output reg         spi_cs_n
+);
+    // SPI clock divider: divide system clk by 4 (adjust as needed)
+    localparam CLK_DIV = 4;
+ 
+    localparam SM_IDLE     = 3'd0;
+    localparam SM_CS_LOW   = 3'd1;
+    localparam SM_SEND     = 3'd2;
+    localparam SM_NEXT     = 3'd3;
+    localparam SM_CS_HIGH  = 3'd4;
+    localparam SM_DONE     = 3'd5;
+ 
+    reg [2:0]  state;
+    reg [6:0]  pkt_idx;      // current packet index
+    reg [15:0] shift_reg;    // 16-bit frame being shifted
+    reg [4:0]  bit_cnt;      // counts 0-15
+    reg [2:0]  clk_div_cnt;  // spi clk divider counter
+    reg        spi_clk_en;
+ 
+    // SPI clock generation (toggle on clk_en)
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            clk_div_cnt <= 0;
+            spi_clk_en  <= 0;
+        end else begin
+            if (clk_div_cnt == CLK_DIV - 1) begin
+                clk_div_cnt <= 0;
+                spi_clk_en  <= 1;
+            end else begin
+                clk_div_cnt <= clk_div_cnt + 1;
+                spi_clk_en  <= 0;
+            end
+        end
+    end
+ 
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            state       <= SM_IDLE;
+            spi_cs_n    <= 1;
+            spi_sclk    <= 0;
+            spi_mosi    <= 0;
+            dump_done   <= 0;
+            pkt_idx     <= 0;
+            bit_cnt     <= 0;
+            shift_reg   <= 0;
+            buf_rd_addr <= 0;
+        end else begin
+            dump_done <= 0;   // default deassert
+ 
+            case (state)
+                SM_IDLE: begin
+                    spi_cs_n <= 1;
+                    spi_sclk <= 0;
+                    if (dump_start) begin
+                        pkt_idx     <= 0;
+                        buf_rd_addr <= 0;
+                        state       <= SM_CS_LOW;
+                    end
+                end
+ 
+                SM_CS_LOW: begin
+                    spi_cs_n <= 0;           // assert chip select
+                    shift_reg <= buf_rd_data; // latch {TX_NO, DATA}
+                    bit_cnt   <= 15;          // MSB first, 16 bits
+                    state     <= SM_SEND;
+                end
+ 
+                SM_SEND: begin
+                    if (spi_clk_en) begin
+                        spi_mosi <= shift_reg[bit_cnt];   // put bit on MOSI
+                        spi_sclk <= ~spi_sclk;            // toggle SCLK
+                        if (spi_sclk) begin               // falling edge: advance
+                            if (bit_cnt == 0) begin
+                                state <= SM_NEXT;
+                            end else begin
+                                bit_cnt <= bit_cnt - 1;
+                            end
+                        end
+                    end
+                end
+ 
+                SM_NEXT: begin
+                    spi_sclk <= 0;
+                    if (pkt_idx == pkt_count - 1) begin
+                        state <= SM_CS_HIGH;
+                    end else begin
+                        pkt_idx     <= pkt_idx + 1;
+                        buf_rd_addr <= pkt_idx + 1;
+                        state       <= SM_CS_LOW;
+                    end
+                end
+ 
+                SM_CS_HIGH: begin
+                    spi_cs_n <= 1;           // deassert chip select
+                    state    <= SM_DONE;
+                end
+ 
+                SM_DONE: begin
+                    dump_done <= 1;
+                    state     <= SM_IDLE;
+                end
+ 
+                default: state <= SM_IDLE;
+            endcase
+        end
+    end
+endmodule
+ 
+ 
+// ─────────────────────────────────────────────────────────────────────────────
+// 5. I2C MASTER  (OpenCores-style, single-byte write)
+//    Sends status byte to an I2C peripheral (e.g. display or logger).
+//    Address: parameterisable (default 7'h50)
+// ─────────────────────────────────────────────────────────────────────────────
+module i2c_master #(
+    parameter CLK_FREQ  = 50_000_000,
+    parameter I2C_FREQ  = 100_000,
+    parameter DEV_ADDR  = 7'h50
+)(
+    input  wire       clk,
+    input  wire       rst_n,
+    // Control
+    input  wire       wr_req,        // pulse: send status_byte
+    input  wire [7:0] status_byte,
+    output reg        busy,
+    output reg        ack_err,
+    // I2C pins
+    output reg        scl,
+    inout  wire       sda
+);
+    localparam CLK_DIV  = CLK_FREQ / (4 * I2C_FREQ);  // quarter-period divider
+ 
+    localparam I_IDLE   = 4'd0;
+    localparam I_START  = 4'd1;
+    localparam I_ADDR   = 4'd2;
+    localparam I_ACK1   = 4'd3;
+    localparam I_DATA   = 4'd4;
+    localparam I_ACK2   = 4'd5;
+    localparam I_STOP   = 4'd6;
+    localparam I_DONE   = 4'd7;
+ 
+    reg [3:0]  state;
+    reg [7:0]  clk_cnt;
+    reg        scl_int, sda_int;
+    reg [7:0]  shift_reg;
+    reg [2:0]  bit_cnt;
+    reg        tick;     // quarter-period tick
+ 
+    assign sda = sda_int ? 1'bz : 1'b0;   // open-drain
+ 
+    // Quarter-period tick generator
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            clk_cnt <= 0;
+            tick    <= 0;
+        end else begin
+            tick <= 0;
+            if (clk_cnt == CLK_DIV - 1) begin
+                clk_cnt <= 0;
+                tick    <= 1;
+            end else begin
+                clk_cnt <= clk_cnt + 1;
+            end
+        end
+    end
+ 
+    // I2C bit-bang FSM (simplified: one tick per SCL quarter-period)
+    // Phase counter within each bit (0=SCL low-before, 1=SCL rise, 2=SCL high, 3=SCL fall)
+    reg [1:0] phase;
+ 
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            state    <= I_IDLE;
+            scl_int  <= 1;
+            sda_int  <= 1;
+            busy     <= 0;
+            ack_err  <= 0;
+            shift_reg<= 0;
+            bit_cnt  <= 7;
+            phase    <= 0;
+            scl      <= 1;
+        end else begin
+            scl <= scl_int;
+ 
+            case (state)
+                // ── IDLE ──────────────────────────────────────────────
+                I_IDLE: begin
+                    scl_int <= 1;
+                    sda_int <= 1;
+                    busy    <= 0;
+                    if (wr_req) begin
+                        busy     <= 1;
+                        ack_err  <= 0;
+                        state    <= I_START;
+                        phase    <= 0;
+                    end
+                end
+ 
+                // ── START condition: SDA falls while SCL high ─────────
+                I_START: begin
+                    if (tick) begin
+                        case (phase)
+                            0: begin sda_int <= 1; scl_int <= 1; phase <= 1; end
+                            1: begin sda_int <= 0; phase   <= 2; end
+                            2: begin scl_int <= 0; phase   <= 0;
+                                     shift_reg <= {DEV_ADDR, 1'b0}; // addr + W
+                                     bit_cnt   <= 7;
+                                     state     <= I_ADDR; end
+                            default: phase <= 0;
+                        endcase
+                    end
+                end
+ 
+                // ── Send 8-bit address+RW ──────────────────────────────
+                I_ADDR: begin
+                    if (tick) begin
+                        case (phase)
+                            0: begin sda_int <= shift_reg[7]; phase <= 1; end
+                            1: begin scl_int <= 1; phase <= 2; end
+                            2: begin scl_int <= 0; phase <= 3; end
+                            3: begin
+                                if (bit_cnt == 0) begin
+                                    sda_int <= 1; // release for ACK
+                                    state   <= I_ACK1;
+                                    phase   <= 0;
+                                end else begin
+                                    shift_reg <= {shift_reg[6:0], 1'b0};
+                                    bit_cnt   <= bit_cnt - 1;
+                                    phase     <= 0;
+                                end
+                            end
+                        endcase
+                    end
+                end
+ 
+                // ── ACK from slave (read SDA) ──────────────────────────
+                I_ACK1: begin
+                    if (tick) begin
+                        case (phase)
+                            0: begin scl_int <= 1; phase <= 1; end
+                            1: begin
+                                ack_err  <= sda;    // SDA should be 0 (ACK)
+                                scl_int  <= 0;
+                                shift_reg<= status_byte;
+                                bit_cnt  <= 7;
+                                state    <= I_DATA;
+                                phase    <= 0;
+                            end
+                            default: phase <= 0;
+                        endcase
+                    end
+                end
+ 
+                // ── Send 8-bit data ────────────────────────────────────
+                I_DATA: begin
+                    if (tick) begin
+                        case (phase)
+                            0: begin sda_int <= shift_reg[7]; phase <= 1; end
+                            1: begin scl_int <= 1; phase <= 2; end
+                            2: begin scl_int <= 0; phase <= 3; end
+                            3: begin
+                                if (bit_cnt == 0) begin
+                                    sda_int <= 1;
+                                    state   <= I_ACK2;
+                                    phase   <= 0;
+                                end else begin
+                                    shift_reg <= {shift_reg[6:0], 1'b0};
+                                    bit_cnt   <= bit_cnt - 1;
+                                    phase     <= 0;
+                                end
+                            end
+                        endcase
+                    end
+                end
+ 
+                // ── Second ACK ─────────────────────────────────────────
+                I_ACK2: begin
+                    if (tick) begin
+                        case (phase)
+                            0: begin scl_int <= 1; phase <= 1; end
+                            1: begin ack_err <= ack_err | sda; scl_int <= 0;
+                                     state <= I_STOP; phase <= 0; end
+                            default: phase <= 0;
+                        endcase
+                    end
+                end
+ 
+                // ── STOP condition: SDA rises while SCL high ──────────
+                I_STOP: begin
+                    if (tick) begin
+                        case (phase)
+                            0: begin sda_int <= 0; scl_int <= 1; phase <= 1; end
+                            1: begin sda_int <= 1; state   <= I_DONE; end
+                            default: phase <= 0;
+                        endcase
+                    end
+                end
+ 
+                I_DONE: begin
+                    busy  <= 0;
+                    state <= I_IDLE;
+                end
+ 
+                default: state <= I_IDLE;
+            endcase
+        end
+    end
+endmodule
+ 
+ 
+// ─────────────────────────────────────────────────────────────────────────────
+// 6. TOP-LEVEL  - uart_blackbox_top
+//    Wires all five modules together.
+// ─────────────────────────────────────────────────────────────────────────────
+module uart_blackbox_top #(
+    parameter CLK_FREQ  = 50_000_000,
+    parameter BAUD_RATE = 115_200,
+    parameter I2C_ADDR  = 7'h50
+)(
+    input  wire clk,
+    input  wire rst_n,
+ 
+    // UART RX pin
+    input  wire uart_rx_pin,
+ 
+    // Trigger inputs
+    input  wire fault_trigger,      // hardware fault (brownout / watchdog)
+    input  wire manual_dump,        // soft / button trigger
+ 
+    // SPI flash pins
+    output wire spi_sclk,
+    output wire spi_mosi,
+    input  wire spi_miso,
+    output wire spi_cs_n,
+ 
+    // I2C pins (status broadcast)
+    output wire i2c_scl,
+    inout  wire i2c_sda,
+ 
+    // Debug / status
+    output wire [1:0]  fsm_state_out,
+    output wire [6:0]  pkt_count_out
+);
+ 
+    // ── Internal wires ──────────────────────────────────────────────────────
+    wire [7:0] uart_data;
+    wire       uart_valid;
+ 
+    wire       buf_wr_en;
+    wire [7:0] buf_wr_data;
+    wire [6:0] buf_pkt_count;
+    wire [6:0] buf_head_ptr;
+    wire [6:0] buf_rd_addr;
+    wire [15:0]buf_rd_data;
+ 
+    wire       dump_start;
+    wire       dump_done;
+ 
+    wire [7:0] i2c_status_byte;
+    wire       i2c_wr_req;
+    wire       i2c_busy;
+    wire       i2c_ack_err;
+ 
+    assign pkt_count_out = buf_pkt_count;
+ 
+    // ── 1. UART RX ──────────────────────────────────────────────────────────
+    uart_rx #(
+        .CLK_FREQ  (CLK_FREQ),
+        .BAUD_RATE (BAUD_RATE)
+    ) u_uart_rx (
+        .clk      (clk),
+        .rst_n    (rst_n),
+        .rx       (uart_rx_pin),
+        .rx_data  (uart_data),
+        .rx_valid (uart_valid)
+    );
+ 
+    // ── 2. PACKET BUFFER ────────────────────────────────────────────────────
+    packet_buffer u_buf (
+        .clk        (clk),
+        .rst_n      (rst_n),
+        .wr_en      (buf_wr_en),
+        .wr_data    (buf_wr_data),
+        .rd_addr    (buf_rd_addr),
+        .rd_data    (buf_rd_data),
+        .pkt_count  (buf_pkt_count),
+        .head_ptr   (buf_head_ptr)
+    );
+ 
+    // ── 3. FSM CONTROLLER ───────────────────────────────────────────────────
+    fsm_controller u_fsm (
+        .clk             (clk),
+        .rst_n           (rst_n),
+        .fault_trigger   (fault_trigger),
+        .manual_dump     (manual_dump),
+        .uart_rx_data    (uart_data),
+        .uart_rx_valid   (uart_valid),
+        .buf_wr_en       (buf_wr_en),
+        .buf_wr_data     (buf_wr_data),
+        .buf_pkt_count   (buf_pkt_count),
+        .dump_start      (dump_start),
+        .dump_done       (dump_done),
+        .i2c_status_byte (i2c_status_byte),
+        .i2c_wr_req      (i2c_wr_req),
+        .fsm_state       (fsm_state_out)
+    );
+ 
+    // ── 4. SPI MASTER ───────────────────────────────────────────────────────
+    spi_master u_spi (
+        .clk         (clk),
+        .rst_n       (rst_n),
+        .dump_start  (dump_start),
+        .pkt_count   (buf_pkt_count),
+        .dump_done   (dump_done),
+        .buf_rd_addr (buf_rd_addr),
+        .buf_rd_data (buf_rd_data),
+        .spi_sclk    (spi_sclk),
+        .spi_mosi    (spi_mosi),
+        .spi_miso    (spi_miso),
+        .spi_cs_n    (spi_cs_n)
+    );
+ 
+    // ── 5. I2C MASTER ───────────────────────────────────────────────────────
+    i2c_master #(
+        .CLK_FREQ (CLK_FREQ),
+        .I2C_FREQ (100_000),
+        .DEV_ADDR (I2C_ADDR)
+    ) u_i2c (
+        .clk         (clk),
+        .rst_n       (rst_n),
+        .wr_req      (i2c_wr_req),
+        .status_byte (i2c_status_byte),
+        .busy        (i2c_busy),
+        .ack_err     (i2c_ack_err),
+        .scl         (i2c_scl),
+        .sda         (i2c_sda)
+    );
+ 
+endmodule
+// =============================================================================
+//  END OF FILE
+// =============================================================================
+ 
